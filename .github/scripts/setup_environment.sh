@@ -95,7 +95,7 @@ function setup_ubuntu_install_dependencies() {
 		git config --global user.name "Your Name"
 	fi
 
-	python3 -m pip install --upgrade pip
+	python3 -m pip install --upgrade pip 2>/dev/null || true
 	python3 -m pip install pyelftools ninja
 
 	# Ice driver dependencies

@@ -70,7 +70,7 @@ jobs:
             "${CLIENT_MTL}" "${BRANCH}" <<'REMOTE_SCRIPT'
           set -ex
           MTL_DIR="$1"
-          BRANCH="$2"
+          BRANCH="${2#refs/heads/}"
           if [ ! -d "${MTL_DIR}/.git" ]; then
             git clone https://github.com/OpenVisualCloud/Media-Transport-Library.git "${MTL_DIR}"
           fi
@@ -79,6 +79,17 @@ jobs:
           git fetch --all --prune
           git checkout "${BRANCH}" 2>/dev/null || git checkout "origin/${BRANCH}" 2>/dev/null || true
           git reset --hard "origin/${BRANCH}" 2>/dev/null || git reset --hard "${BRANCH}"
+
+          # Cleanup processes (same as .github/actions/cleanup)
+          sudo killall -SIGKILL gtest.sh KahawaiTest KahawaiUfdTest KahawaiUplTest ffmpeg RxTxApp 2>/dev/null || true
+          sudo killall -SIGINT pytest MtlManager phc2sys ptp4l netsniff-ng 2>/dev/null || true
+          sleep 2
+
+          # Build (same env vars as .github/actions/build)
+          export SETUP_BUILD_AND_INSTALL_DPDK=0
+          export SETUP_BUILD_AND_INSTALL_ICE_DRIVER=0
+          export SETUP_BUILD_AND_INSTALL_EBPF_XDP=0
+          export SETUP_BUILD_AND_INSTALL_GPU_DIRECT=0
           export MTL_BUILD_AND_INSTALL=1
           export ECOSYSTEM_BUILD_AND_INSTALL_FFMPEG_PLUGIN=1
           export ECOSYSTEM_BUILD_AND_INSTALL_GSTREAMER_PLUGIN=1
