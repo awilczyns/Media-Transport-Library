@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import time
 from typing import Any, Dict
 
@@ -353,15 +352,67 @@ def _select_capture_host(hosts: dict):
     return hosts["client"] if "client" in hosts else list(hosts.values())[0]
 
 
-@pytest.fixture(scope="function")
-def ptp_sync(request, test_config: dict, hosts):
-    """Start phc2sys or ptp4l for the capture interface before tests.
+def _resolve_capture_phc(host, capture_iface):
+    """Return the `/dev/ptpX` path for `capture_iface` on `host`."""
+    res = host.connection.execute_command(f"sudo ethtool -T {capture_iface}")
+    for line in (res.stdout or "").splitlines():
+        if "PTP Hardware Clock:" in line and ":" in line:
+            idx = line.split(":", 1)[1].strip()
+            if idx.isdigit():
+                return f"/dev/ptp{idx}"
+    raise RuntimeError(
+        f"Cannot resolve PTP Hardware Clock for {capture_iface}: {res.stdout}"
+    )
 
-    - Uses the same interface selection logic as PCAP capture.
-    - For tests marked with @pytest.mark.ptp: starts ptp4l for PTP synchronization.
-    - For other tests: detects PTP Hardware Clock via `ethtool -T` and runs phc2sys.
 
-    The process is stopped at the end of the test.
+def _seed_phc_if_unset(host, ptp_dev):
+    """Seed PHC time from CLOCK_REALTIME if it reports a pre-2020 epoch.
+
+    A cold-booted Intel E810 PHC reports time from epoch 0. Letting phc2sys
+    discipline CLOCK_REALTIME from such a clock steps wall time backwards by
+    decades, which corrupts systemd-journald and breaks SSH/cron timers.
+    """
+    res = host.connection.execute_command(f"sudo phc_ctl {ptp_dev} get 2>&1 || true")
+    match = re.search(r"clock time is\s+(\d+)", res.stdout or "")
+    phc_secs = int(match.group(1)) if match else 0
+    # 1577836800 = 2020-01-01 UTC. Anything earlier is implausible.
+    if phc_secs < 1577836800:
+        logger.warning(
+            f"PHC {ptp_dev} reports epoch {phc_secs} (< 2020); "
+            "seeding from system clock to avoid CLOCK_REALTIME backward step"
+        )
+        host.connection.execute_command(f"sudo phc_ctl {ptp_dev} 'set;'")
+
+
+def _reap_phc_daemons(host):
+    """Kill any phc2sys/ptp4l daemons on `host`.
+
+    `pkill -x` matches `/proc/<pid>/comm` exactly and is immune to the shell
+    quoting issues that affect `pkill -f` patterns.
+    """
+    host.connection.execute_command(
+        "sudo pkill -TERM -x phc2sys 2>/dev/null; "
+        "sudo pkill -TERM -x ptp4l 2>/dev/null; "
+        "sleep 0.5; "
+        "sudo pkill -KILL -x phc2sys 2>/dev/null; "
+        "sudo pkill -KILL -x ptp4l 2>/dev/null; true"
+    )
+
+
+@pytest.fixture(scope="session")
+def phc2sys_daemon(test_config: dict, hosts):
+    """Run exactly one phc2sys per session, disciplining CLOCK_REALTIME from
+    the capture-interface PHC.
+
+    Required because EBU LIST compliance metrics (VRX, PTP-offset, Cinst)
+    compare pcap arrival timestamps (CLOCK_REALTIME) against RTP timestamps
+    derived from the same PHC the sender uses. CLOCK_REALTIME must track
+    that PHC to within microseconds or the metrics are meaningless.
+
+    Exactly one daemon: stacking phc2sys clients on /dev/ptpX while the
+    framework cycles SR-IOV VFs has been observed to use-after-free the
+    `ice` driver in `ptp_clock_index()` and wedge the host (kernel oops,
+    then full hang requiring BMC reset).
     """
     capture_cfg = test_config.get("capture_cfg", {})
     if not (capture_cfg and capture_cfg.get("enable")):
@@ -373,93 +424,85 @@ def ptp_sync(request, test_config: dict, hosts):
     capture_iface = _select_sniff_interface_name(
         host, capture_cfg, single_host=is_single_host
     )
+    capture_ptp = _resolve_capture_phc(host, capture_iface)
 
-    # For tests marked with @pytest.mark.ptp, start ptp4l instead of phc2sys
-    if request.node.get_closest_marker("ptp"):
-        logger.info(f"Starting ptp4l for PTP synchronization (iface={capture_iface})")
-
-        log_path = f"/tmp/ptp4l-{capture_iface}.log"
-        ptp4l_cmd = f"sudo ptp4l -i '{capture_iface}' -s -m -2"
-        ptp4l_process = host.connection.start_process(
-            ptp4l_cmd,
-            stderr_to_stdout=True,
-            output_file=log_path,
-        )
-
-        # Give ptp4l a moment to fail fast (e.g., missing interface).
-        time.sleep(0.2)
-        if not ptp4l_process.running:
-            raise RuntimeError(
-                f"Failed to start ptp4l (iface={capture_iface}). log={log_path}"
-            )
-
-        try:
-            yield
-        finally:
-            if not ptp4l_process:
-                return
-
-            if not ptp4l_process.running:
-                raise RuntimeError(
-                    f"ptp4l process (iface={capture_iface}) "
-                    f"stopped unexpectedly. See log: {log_path}"
-                )
-
-            ptp4l_process.kill(wait=None, with_signal=signal.SIGTERM)
-        return
-
-    # For non-PTP tests, start phc2sys
-    ptp_details = host.connection.execute_command(
-        f"sudo ethtool -T '{capture_iface}' 2>/dev/null || true"
-    )
-    ptp_idx = ""
-    for line in (ptp_details.stdout or "").splitlines():
-        # Keep this equivalent to: awk -F': ' '/PTP Hardware Clock:/ {print $2; exit}'
-        if "PTP Hardware Clock:" in line:
-            ptp_idx = line.split(": ", 1)[1].strip() if ": " in line else ""
-            break
-
-    if not ptp_idx.isdigit():
-        raise RuntimeError(
-            "ERROR: failed to parse PTP Hardware Clock index for "
-            f"{capture_iface}. Details: {ptp_details.stdout}{ptp_details.stderr}"
-        )
-
-    capture_ptp = f"/dev/ptp{ptp_idx}"
-
-    logger.info(
-        f"Starting phc2sys: {capture_ptp} -> CLOCK_REALTIME (iface={capture_iface})"
-    )
+    # Reap stragglers from prior crashed runs before claiming /dev/ptpX.
+    _reap_phc_daemons(host)
+    _seed_phc_if_unset(host, capture_ptp)
 
     log_path = f"/tmp/phc2sys-{capture_iface}.log"
-    phc2sys_cmd = "sudo phc2sys " f"-s '{capture_ptp}' -c CLOCK_REALTIME -O 0 -m"
-    phc2sys_process = host.connection.start_process(
-        phc2sys_cmd,
+    logger.info(
+        f"Starting phc2sys (session): {capture_ptp} -> CLOCK_REALTIME "
+        f"(iface={capture_iface}, log={log_path})"
+    )
+    host.connection.start_process(
+        f"sudo phc2sys -s {capture_ptp} -c CLOCK_REALTIME -O 0 -m",
         stderr_to_stdout=True,
         output_file=log_path,
     )
-
-    # Give phc2sys a moment to fail fast (e.g., missing /dev/ptpX permissions).
-    time.sleep(0.2)
-    if not phc2sys_process.running:
-        raise RuntimeError(
-            f"Failed to start phc2sys (iface={capture_iface}, ptp={capture_ptp}). "
-            f"log={log_path}"
-        )
+    time.sleep(0.3)
+    res = host.connection.execute_command("pgrep -x phc2sys || true")
+    if not (res.stdout or "").strip():
+        raise RuntimeError(f"phc2sys failed to start for {capture_ptp}; see {log_path}")
 
     try:
         yield
     finally:
-        if not phc2sys_process:
-            return
+        _reap_phc_daemons(host)
 
-        if not phc2sys_process.running:
-            raise RuntimeError(
-                f"phc2sys process (iface={capture_iface}, ptp={capture_ptp}) "
-                f"stopped unexpectedly. See log: {log_path}"
-            )
 
-        phc2sys_process.kill(wait=None, with_signal=signal.SIGTERM)
+@pytest.fixture(scope="function")
+def ptp_sync(request, test_config: dict, hosts, phc2sys_daemon):
+    """Per-test PTP setup.
+
+    For `@pytest.mark.ptp` tests, runs ptp4l on the capture interface for
+    the test duration. All other tests rely on the session-scoped
+    `phc2sys_daemon` for CLOCK_REALTIME accuracy.
+    """
+    capture_cfg = test_config.get("capture_cfg", {})
+    if not (capture_cfg and capture_cfg.get("enable")):
+        yield
+        return
+
+    if not request.node.get_closest_marker("ptp"):
+        yield
+        return
+
+    host = _select_capture_host(hosts)
+    is_single_host = len(hosts) == 1
+    capture_iface = _select_sniff_interface_name(
+        host, capture_cfg, single_host=is_single_host
+    )
+    log_path = f"/tmp/ptp4l-{capture_iface}.log"
+
+    logger.info(f"Starting ptp4l (iface={capture_iface}, log={log_path})")
+    host.connection.start_process(
+        f"sudo ptp4l -i {capture_iface} -s -m -2",
+        stderr_to_stdout=True,
+        output_file=log_path,
+    )
+    time.sleep(0.3)
+    res = host.connection.execute_command("pgrep -x ptp4l || true")
+    if not (res.stdout or "").strip():
+        raise RuntimeError(f"ptp4l failed to start for {capture_iface}; see {log_path}")
+
+    try:
+        yield
+    finally:
+        # Use `pkill -x ptp4l` (exact comm match) rather than `pkill -f`.
+        # `pkill -f` matches against /proc/<pid>/cmdline of *every* process,
+        # including the bash subshell currently executing this teardown
+        # one-liner -- whose argv literally contains the string
+        # "ptp4l -i {capture_iface}". That self-match SIGTERMs our own
+        # shell, the SSH channel hangs up, and mfd_connect surfaces it as
+        # ConnectionCalledProcessError(SIGHUP), turning a passing test
+        # into ERROR-at-teardown. There is only one ptp4l per host in
+        # this fixture, so an exact comm match is sufficient.
+        host.connection.execute_command(
+            "sudo pkill -TERM -x ptp4l 2>/dev/null; "
+            "sleep 0.3; "
+            "sudo pkill -KILL -x ptp4l 2>/dev/null; true"
+        )
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
@@ -972,48 +1015,102 @@ def collect_platform_config(hosts, log_session):
             logger.warning(f"Failed to collect platform info from {host.name}: {e}")
 
 
+def _capture_budget(stream_info, capture_cfg, test_time):
+    """Compute (packets_capture, capture_time) for NetsniffRecorder.
+
+    Implements the EBU LIST ST 2110 test-plan capture sizing:
+
+    * Operator overrides (`packets_number`, `capture_time`, `frames_number`
+      in `capture_cfg`) win.
+    * Video streams (info dict carries `width`/`height`): capture
+      `frames_number` (default `FRAMES_CAPTURE`) full frames, with a
+      `n / fps + 0.5 s` time cap so a slower-than-expected sender can't
+      truncate the pcap mid-frame.
+    * Audio / ANC / unknown: time-based capture for `test_time` seconds —
+      one Cmax window (~125 ms) is the EBU minimum, `test_time` always
+      satisfies it.
+    """
+    if "packets_number" in capture_cfg:
+        return capture_cfg["packets_number"], capture_cfg.get("capture_time")
+    if "capture_time" in capture_cfg:
+        return None, capture_cfg["capture_time"]
+
+    n_frames = capture_cfg.get("frames_number", FRAMES_CAPTURE)
+    if stream_info and "width" in stream_info and "height" in stream_info:
+        packets = n_frames * calculate_packets_per_frame(stream_info)
+        try:
+            fps = float(str(stream_info.get("fps", 30)).lstrip("ip"))
+        except (TypeError, ValueError):
+            fps = 30.0
+        return packets, n_frames / fps + 0.5
+
+    return None, test_time
+
+
+@pytest.fixture
+def stream_info(request) -> dict | None:
+    """Stream metadata used by `pcap_capture` to size the EBU LIST capture.
+
+    Default: the parametrized `media_file`'s info dict, when the test
+    requests that fixture. Tests that don't use `media_file` (multi-stream,
+    synthetic-pattern, audio/ANC) override this fixture in a local
+    `conftest.py` to declare what the producer is sending; for video, the
+    dict needs at least `width`, `height` and `fps`.
+    """
+    if "media_file" in request.fixturenames:
+        info, _ = request.getfixturevalue("media_file")
+        return info
+    return None
+
+
 @pytest.fixture(scope="function")
 def pcap_capture(
-    request, media_file, test_config, hosts, mtl_path, ptp_sync, prepare_ramdisk
+    request,
+    test_config,
+    test_time,
+    hosts,
+    mtl_path,
+    stream_info,
+    ptp_sync,
+    prepare_ramdisk,
 ):
-    """Fixture for capturing pcap files during tests.
+    """Capture a pcap on the sniff interface and submit it to EBU LIST.
 
-    Note: This fixture depends on prepare_ramdisk to ensure proper cleanup order.
-    The netsniff-ng process must be stopped BEFORE the ramdisk is unmounted,
-    otherwise the unmount will fail with 'device busy'.
+    Sizing follows the EBU ST 2110 test plan via `_capture_budget`, using
+    the `stream_info` fixture (which tests override when not parametrizing
+    `media_file`).
+
+    Depends on `prepare_ramdisk` so netsniff-ng stops before the ramdisk
+    unmount; otherwise the unmount fails with 'device busy'.
     """
-    capture_cfg = test_config.get("capture_cfg", {})
-    capturer = None
-    if capture_cfg and capture_cfg.get("enable"):
-        host = _select_capture_host(hosts)
-        is_single_host = len(hosts) == 1
-        media_file_info, _ = media_file
-        test_name = request.node.name
-        if "frames_number" not in capture_cfg and "capture_time" not in capture_cfg:
-            capture_cfg["packets_number"] = (
-                FRAMES_CAPTURE * calculate_packets_per_frame(media_file_info)
-            )
-            logger.info(
-                f"Capture {capture_cfg['packets_number']} packets for {FRAMES_CAPTURE} frames"
-            )
-        elif "frames_number" in capture_cfg:
-            capture_cfg["packets_number"] = capture_cfg[
-                "frames_number"
-            ] * calculate_packets_per_frame(media_file_info)
-            logger.info(
-                f"Capture {capture_cfg['packets_number']} packets for {capture_cfg['frames_number']} frames"
-            )
-        capturer = NetsniffRecorder(
-            host=host,
-            test_name=test_name,
-            pcap_dir=capture_cfg.get("pcap_dir", "/tmp"),
-            interface=_select_sniff_interface_name(
-                host, capture_cfg, single_host=is_single_host
-            ),
-            silent=capture_cfg.get("silent", True),
-            packets_capture=capture_cfg.get("packets_number", None),
-            capture_time=capture_cfg.get("capture_time", None),
-        )
+    capture_cfg = dict(test_config.get("capture_cfg") or {})
+    if not capture_cfg.get("enable"):
+        yield None
+        return
+
+    host = _select_capture_host(hosts)
+    is_single_host = len(hosts) == 1
+    packets_capture, capture_time = _capture_budget(
+        stream_info, capture_cfg, test_time
+    )
+    logger.info(
+        "pcap_capture: stream=%s packets=%s capture_time=%s",
+        (stream_info or {}).get("filename"),
+        packets_capture,
+        capture_time,
+    )
+
+    capturer = NetsniffRecorder(
+        host=host,
+        test_name=request.node.name,
+        pcap_dir=capture_cfg.get("pcap_dir", "/tmp"),
+        interface=_select_sniff_interface_name(
+            host, capture_cfg, single_host=is_single_host
+        ),
+        silent=capture_cfg.get("silent", True),
+        packets_capture=packets_capture,
+        capture_time=capture_time,
+    )
     try:
         yield capturer
     finally:
