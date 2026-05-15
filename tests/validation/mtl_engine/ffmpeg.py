@@ -150,6 +150,11 @@ class FFmpeg(Application):
 
         video_size, fps = ffmpeg_app.decode_video_format_16_9(video_format)
         rx_f_flag = "-f rawvideo" if output_format == "yuv" else "-c:v libopenh264"
+        # Non-default pix_fmts trigger an upstream transcode (see
+        # generate_reference_file) that delays TX warm-up by seconds on slow CI
+        # storage. Bump RX init_retry so the receiver doesn't tear down its
+        # mtl_st20p context before the first RTP packet arrives.
+        init_retry = 20 if pix_fmt == "yuv422p10le" else 200
 
         if not multiple:
             rx_cmd = (
@@ -158,7 +163,7 @@ class FFmpeg(Application):
                 f"-p_rx_ip {ip_pools.rx_multicast[0]} -udp_port 20000 "
                 f"-payload_type 112 -fps {fps} -pix_fmt {pix_fmt} "
                 f"-video_size {video_size} -f mtl_st20p -i k "
-                f"-init_retry 20 "
+                f"-init_retry {init_retry} "
                 f"{rx_f_flag} {{out0}} -y"
             )
         else:
@@ -180,9 +185,7 @@ class FFmpeg(Application):
             # Default source pix_fmt (yuv422p10le) needs an explicit fps filter
             # to lock the rate; pre-converted sources already carry the right
             # framerate, so adding the filter would re-time the frames.
-            tx_filter = (
-                f"-filter:v fps={fps}" if pix_fmt == "yuv422p10le" else ""
-            )
+            tx_filter = f"-filter:v fps={fps}" if pix_fmt == "yuv422p10le" else ""
             self._tx_commands = [
                 self._ffmpeg_st20p_tx_cmd(
                     video_size=video_size,
