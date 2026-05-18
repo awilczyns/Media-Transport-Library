@@ -154,7 +154,11 @@ class FFmpeg(Application):
         # generate_reference_file) that delays TX warm-up by seconds on slow CI
         # storage. Bump RX init_retry so the receiver doesn't tear down its
         # mtl_st20p context before the first RTP packet arrives.
-        init_retry = 20 if pix_fmt == "yuv422p10le" else 200
+        # NOTE: the mtl_st20p plugin caps init_retry at 60 (see
+        # ecosystem/ffmpeg_plugin/mtl_st20p_rx.c AVOption schema); values above
+        # that are rejected by libavutil and the plugin falls back to its
+        # default of 5, causing immediate EIO and 0-byte output.
+        init_retry = 20 if pix_fmt == "yuv422p10le" else 60
 
         if not multiple:
             rx_cmd = (
