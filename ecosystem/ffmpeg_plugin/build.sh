@@ -111,7 +111,15 @@ build_ffmpeg() {
 		# Ensure FFmpeg can find libraries installed in its own prefix (e.g. openh264)
 		export PKG_CONFIG_PATH="${MTL_INSTALL_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 		export LD_LIBRARY_PATH="${MTL_INSTALL_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-		./configure --prefix="${MTL_INSTALL_PREFIX}" --enable-shared --disable-static --enable-pic --enable-libopenh264 --enable-encoder=libopenh264 --enable-mtl $extra_config_flags
+		# Embed RPATH so the binary and libav*/libsw* always resolve siblings
+		# from this prefix first, regardless of ld.so.cache ordering. Without
+		# this, a system-wide FFmpeg (e.g. /usr/local/lib/libav*.so.<MAJOR>)
+		# can shadow our build at runtime — observed symptom is the FFmpeg
+		# "library configuration mismatch" warning and AVPixelFormat enum
+		# values being interpreted against the wrong header, causing the
+		# mtl_st20p mux/demux to report "unsupported pixel format" for any
+		# pix_fmt whose enum index differs between the two builds.
+		./configure --prefix="${MTL_INSTALL_PREFIX}" --enable-shared --disable-static --enable-pic --enable-libopenh264 --enable-encoder=libopenh264 --enable-mtl --enable-rpath --extra-ldflags="-Wl,-rpath,${MTL_INSTALL_PREFIX}/lib" $extra_config_flags
 		make -j "$(nproc)"
 		make install
 	else
