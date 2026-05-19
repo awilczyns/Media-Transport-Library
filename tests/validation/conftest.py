@@ -399,6 +399,23 @@ def _reap_phc_daemons(host):
     )
 
 
+def _sniff_iface_collides_with_mtl(sniff_nic, hosts) -> bool:
+    """True if `sniff_nic` is a PF that MTL will rebind to vfio-pci.
+
+    Holding `/dev/ptpX` open (phc2sys/ptp4l) while the `ice` driver
+    re-initialises the PHC during SR-IOV VF setup triggers a
+    use-after-free in `ptp_clock_index()` and wedges the host. The only
+    safe sniff target is a NIC outside every host's `network_interfaces`
+    (e.g. a dedicated out-of-band capture port).
+    """
+    sniff_bdf = str(sniff_nic.pci_address.lspci).lower()
+    for host in hosts.values():
+        for nic in host.network_interfaces:
+            if str(nic.pci_address.lspci).lower() == sniff_bdf:
+                return True
+    return False
+
+
 @pytest.fixture(scope="session")
 def phc2sys_daemon(test_config: dict, hosts):
     """Run exactly one phc2sys per session, disciplining CLOCK_REALTIME from
@@ -421,9 +438,20 @@ def phc2sys_daemon(test_config: dict, hosts):
 
     host = _select_capture_host(hosts)
     is_single_host = len(hosts) == 1
-    capture_iface = _select_sniff_interface_name(
-        host, capture_cfg, single_host=is_single_host
-    )
+    sniff_nic = _select_sniff_interface(host, capture_cfg, single_host=is_single_host)
+    capture_iface = sniff_nic.name
+
+    if _sniff_iface_collides_with_mtl(sniff_nic, hosts):
+        logger.warning(
+            "Skipping phc2sys: sniff iface %s (%s) is an MTL PF; running "
+            "phc2sys against it races ice driver VF setup and wedges the "
+            "host. pcap timestamps will use the system clock instead.",
+            capture_iface,
+            sniff_nic.pci_address.lspci,
+        )
+        yield
+        return
+
     capture_ptp = _resolve_capture_phc(host, capture_iface)
 
     # Reap stragglers from prior crashed runs before claiming /dev/ptpX.
@@ -470,9 +498,19 @@ def ptp_sync(request, test_config: dict, hosts, phc2sys_daemon):
 
     host = _select_capture_host(hosts)
     is_single_host = len(hosts) == 1
-    capture_iface = _select_sniff_interface_name(
-        host, capture_cfg, single_host=is_single_host
-    )
+    sniff_nic = _select_sniff_interface(host, capture_cfg, single_host=is_single_host)
+    capture_iface = sniff_nic.name
+
+    if _sniff_iface_collides_with_mtl(sniff_nic, hosts):
+        logger.warning(
+            "Skipping ptp4l: sniff iface %s (%s) is an MTL PF; running "
+            "ptp4l against it races ice driver VF setup and wedges the host.",
+            capture_iface,
+            sniff_nic.pci_address.lspci,
+        )
+        yield
+        return
+
     log_path = f"/tmp/ptp4l-{capture_iface}.log"
 
     logger.info(f"Starting ptp4l (iface={capture_iface}, log={log_path})")
