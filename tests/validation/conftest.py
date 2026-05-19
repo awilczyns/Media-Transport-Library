@@ -39,7 +39,7 @@ from mtl_engine.csv_report import (
     get_compliance_result,
     update_compliance_result,
 )
-from mtl_engine.execute import kill_stale_processes, log_fail
+from mtl_engine.execute import kill_stale_processes
 from mtl_engine.ramdisk import Ramdisk
 from mtl_engine.rxtxapp import RxTxApp
 from mtl_engine.stash import (
@@ -1178,6 +1178,29 @@ def pcap_capture(
 
     host = _select_capture_host(hosts)
     is_single_host = len(hosts) == 1
+    sniff_nic = _select_sniff_interface(host, capture_cfg, single_host=is_single_host)
+
+    # If the resolved sniff interface is an MTL PF, capture is doomed:
+    #   * netsniff-ng running on the PF races the ice driver while it
+    #     re-initialises the PHC during SR-IOV VF setup -> RxTxApp aborts
+    #     (return code 251 / DPDK EAL stall).
+    #   * Even when RxTxApp survives, VF-to-VF loopback traffic stays inside
+    #     the PF's embedded switch and never reaches the kernel queue
+    #     netsniff-ng reads from, so the pcap contains 0 RTP packets and
+    #     EBU LIST compliance has nothing to score.
+    # The supported path is a dedicated out-of-band capture NIC (different
+    # PCI device, own PHC); see `capture_cfg.sniff_interface` + the
+    # `multi_nic` runner label gating in the GitHub workflows. Until such a
+    # NIC is provided, skip rather than burn a noisy red test.
+    if _sniff_iface_collides_with_mtl(sniff_nic, hosts):
+        pytest.skip(
+            f"pcap_capture: sniff iface {sniff_nic.name} "
+            f"({sniff_nic.pci_address.lspci}) is an MTL PF -- VF-to-VF "
+            f"loopback traffic is not observable on the PF and netsniff-ng "
+            f"races ice SR-IOV. Provide capture_cfg.sniff_interface=<OOB NIC> "
+            f"on a multi_nic-labelled runner."
+        )
+
     packets_capture, capture_time = _capture_budget(stream_info, capture_cfg, test_time)
     logger.info(
         "pcap_capture: stream=%s packets=%s capture_time=%s",
@@ -1190,9 +1213,7 @@ def pcap_capture(
         host=host,
         test_name=request.node.name,
         pcap_dir=capture_cfg.get("pcap_dir", "/tmp"),
-        interface=_select_sniff_interface_name(
-            host, capture_cfg, single_host=is_single_host
-        ),
+        interface=sniff_nic.name,
         silent=capture_cfg.get("silent", True),
         packets_capture=packets_capture,
         capture_time=capture_time,
@@ -1249,8 +1270,15 @@ def pcap_capture(
                                 "not see VF-to-VF loopback traffic)"
                             )
                         else:
+                            # Record the compliance failure for the report; the
+                            # actual test outcome is decided by ``log_case``
+                            # (see the ``compliance == "Fail"`` branch), which
+                            # converts this into a TEST_FAIL row.  Do NOT call
+                            # ``log_fail`` here: it would invoke ``pytest.fail``
+                            # in teardown and turn an otherwise-passing test
+                            # into an ERROR, double-reporting the same failure.
                             update_compliance_result(request.node.nodeid, "Fail")
-                            log_fail("PCAP compliance check failed")
+                            logger.error("PCAP compliance check failed")
                             logger.info(f"Compliance report: {report}")
 
                 # Remove pcap file after upload to free up ramdisk space
