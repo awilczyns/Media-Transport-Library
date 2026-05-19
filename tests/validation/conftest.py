@@ -244,6 +244,41 @@ def _get_active_vf_pf_indices(host) -> set:
     return indices
 
 
+class _OOBCaptureNIC:
+    """Minimal stand-in for an out-of-band capture interface.
+
+    Mirrors only the attributes other helpers consult: ``name`` for
+    netsniff-ng and ``pci_address.lspci`` for the MTL-PF collision guard.
+    Built on demand from live sysfs when the operator names a capture
+    iface that isn't (and shouldn't be) in ``host.network_interfaces``.
+    """
+
+    class _PciAddr:
+        def __init__(self, bdf: str) -> None:
+            self.lspci = bdf
+
+    def __init__(self, name: str, bdf: str) -> None:
+        self.name = name
+        self.pci_address = _OOBCaptureNIC._PciAddr(bdf)
+
+
+def _resolve_oob_capture_nic(host, ifname: str):
+    """Look up an out-of-band capture netdev on `host` by name.
+
+    Returns an `_OOBCaptureNIC` if the netdev exists and has a resolvable
+    PCI BDF, else None. Read-only: never touches the netdev driver or PHC.
+    """
+    res = host.connection.execute_command(
+        f"readlink -f /sys/class/net/{ifname}/device 2>/dev/null || true"
+    )
+    path = (res.stdout or "").strip()
+    # /sys/devices/pci0000:00/0000:38:00.0  --> basename is the BDF
+    match = re.search(r"([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9])$", path)
+    if not match:
+        return None
+    return _OOBCaptureNIC(ifname, match.group(1).lower())
+
+
 def _select_sniff_interface(host, capture_cfg: dict, *, single_host: bool = True):
     """Choose the best network interface for netsniff-ng packet capture.
 
@@ -276,11 +311,26 @@ def _select_sniff_interface(host, capture_cfg: dict, *, single_host: bool = True
         for nic in host.network_interfaces:
             if nic.name == str(sniff_interface):
                 return nic
+        # Not found in network_interfaces -- treat as an out-of-band capture
+        # NIC (intentionally reserved outside MTL's list of usable PFs).
+        # This is the supported path for rx_timing on multi-NIC hosts: the
+        # OOB capture NIC has its own PHC so phc2sys/ptp4l won't race the
+        # ice driver during SR-IOV VF setup, and the sniff-vs-MTL collision
+        # guard naturally passes because the BDF isn't in network_interfaces.
+        oob = _resolve_oob_capture_nic(host, str(sniff_interface))
+        if oob is not None:
+            logger.info(
+                "Using out-of-band capture NIC %s (%s) -- not in network_interfaces",
+                oob.name,
+                oob.pci_address.lspci,
+            )
+            return oob
         available = [
             f"{nic.name} ({nic.pci_address.lspci})" for nic in host.network_interfaces
         ]
         raise RuntimeError(
-            f"capture_cfg.sniff_interface={sniff_interface} not found on host {host.name}. "
+            f"capture_cfg.sniff_interface={sniff_interface} not found on host {host.name} "
+            f"(neither in network_interfaces nor as a live netdev). "
             f"Available interfaces: {', '.join(available)}"
         )
 
@@ -1128,9 +1178,7 @@ def pcap_capture(
 
     host = _select_capture_host(hosts)
     is_single_host = len(hosts) == 1
-    packets_capture, capture_time = _capture_budget(
-        stream_info, capture_cfg, test_time
-    )
+    packets_capture, capture_time = _capture_budget(stream_info, capture_cfg, test_time)
     logger.info(
         "pcap_capture: stream=%s packets=%s capture_time=%s",
         (stream_info or {}).get("filename"),

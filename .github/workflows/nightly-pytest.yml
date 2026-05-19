@@ -39,7 +39,11 @@ jobs:
           - virtio_user
           - xdp
       fail-fast: false
-    runs-on: ${{ matrix.nic }}
+    # rx_timing requires a dedicated out-of-band capture NIC (separate PHC)
+    # so phc2sys/ptp4l on the sniff interface doesn't race ice driver SR-IOV
+    # VF setup and wedge the host. Runners that meet this requirement carry
+    # the `multi_nic` label in addition to the per-NIC label.
+    runs-on: ${{ matrix.dir == 'rx_timing' && fromJSON(format('["{0}", "multi_nic"]', matrix.nic)) || matrix.nic }}
     timeout-minutes: 720
     steps:
       - name: 'preparation: Harden Runner'

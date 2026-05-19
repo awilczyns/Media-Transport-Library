@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: false
+      require_multi_nic:
+        description: 'Require runner with `multi_nic` label (needed for rx_timing: dedicated OOB capture NIC with its own PHC)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,7 +47,7 @@ jobs:
 
   run-pytest:
     needs: build
-    runs-on: "${{ inputs.nic }}"
+    runs-on: ${{ inputs.require_multi_nic && fromJSON(format('["{0}", "multi_nic"]', inputs.nic)) || inputs.nic }}
     timeout-minutes: 720
     steps:
       - name: Harden-Runner
