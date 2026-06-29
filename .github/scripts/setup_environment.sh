@@ -562,7 +562,74 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
 	if [ "${PLUGIN_BUILD_AND_INSTALL_JPEGXS}" == "1" ]; then
 		echo "$STEP Plugin JPEG-XS build and install"
-		bash "${root_folder}/script/build_st22_jpegxs_plugin.sh"
+
+		lib_so="libst_plugin_st22_svt_jpeg_xs.so"
+		need_build=0
+
+		# Check plugin .so
+		if ! ldconfig -p 2>/dev/null | grep -q "${lib_so}" &&
+			! test -f /usr/local/lib/x86_64-linux-gnu/${lib_so} &&
+			! test -f /usr/local/lib64/${lib_so}; then
+			echo "MTL JPEG-XS plugin not found."
+			need_build=1
+		fi
+
+		# Check core SvtJpegxs version
+		lib_path=$(ldconfig -p 2>/dev/null | grep -oE '/[^[:space:]]*libSvtJpegxs\.so\.0' | head -n1)
+		if [ -n "${lib_path}" ]; then
+			real_lib=$(readlink -f "${lib_path}")
+			if echo "${real_lib}" | grep -q '0.9.0'; then
+				echo "Outdated core SvtJpegxs (${real_lib}) detected on host."
+				need_build=1
+			fi
+		else
+			echo "Core SvtJpegxs library not found."
+			need_build=1
+		fi
+
+		if [ "${need_build}" -eq 0 ]; then
+			echo "=== SVT-JPEG-XS and MTL bridge plugin are already up-to-date. Alignment skipped ==="
+		else
+			JPEGXS_REPO="${setup_script_folder}/SVT-JPEG-XS"
+			if [ ! -d "${JPEGXS_REPO}" ]; then
+				git clone --depth 1 https://github.com/OpenVisualCloud/SVT-JPEG-XS.git "${JPEGXS_REPO}"
+			fi
+
+			# Build and install SVT-JPEG-XS library
+			pushd "${JPEGXS_REPO}/Build/linux" >/dev/null || exit 1
+			./build.sh install
+			popd >/dev/null
+
+			# Build and install imtl-plugin (MTL JPEG-XS encoder/decoder bridge)
+			pushd "${JPEGXS_REPO}/imtl-plugin" >/dev/null || exit 1
+			rm -rf build
+			meson setup build
+			meson compile -C build
+			sudo meson install -C build
+			popd >/dev/null
+
+			# Rebuild FFmpeg with JPEG-XS support
+			FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
+			FFMPEG_JPEGXS_DIR="${setup_script_folder}/ffmpeg-jpegxs"
+			if [ -d "${FFMPEG_JPEGXS_DIR}" ]; then
+				rm -rf "${FFMPEG_JPEGXS_DIR}"
+			fi
+
+			wget -q "https://github.com/FFmpeg/FFmpeg/archive/refs/heads/release/${FFMPEG_VERSION}.zip" -O "${setup_script_folder}/ffmpeg-${FFMPEG_VERSION}.zip"
+			unzip -q "${setup_script_folder}/ffmpeg-${FFMPEG_VERSION}.zip" -d "${setup_script_folder}" && rm -f "${setup_script_folder}/ffmpeg-${FFMPEG_VERSION}.zip"
+			mv "${setup_script_folder}/FFmpeg-release-${FFMPEG_VERSION}" "${FFMPEG_JPEGXS_DIR}"
+
+			pushd "${FFMPEG_JPEGXS_DIR}" >/dev/null || exit 1
+			cp -f "${JPEGXS_REPO}/ffmpeg-plugin/libsvtjpegxs"* libavcodec/
+			git init && git add -A && git commit -m "init" --quiet
+			git am --whitespace=fix "${JPEGXS_REPO}/ffmpeg-plugin/${FFMPEG_VERSION}"/*.patch
+			./configure --enable-shared --disable-static --enable-pic --enable-libsvtjpegxs
+			make -j"${nproc}"
+			sudo make install
+			popd >/dev/null
+
+			sudo ldconfig
+		fi
 		STEP=$((STEP + 1))
 	fi
 
